@@ -1,0 +1,5 @@
+TOKEN = "7778263669:AAG-RZGRMOkTb7sjmKzGzg-Cz6UmuVfJHzQ"
+MANIFEST_URL = "https://raw.githubusercontent.com/Shvandre/TonFUND/main/manifest.json"
+tonapi_key = "SDFKOASFK"
+admin_address = ""
+escrow_code = ""
