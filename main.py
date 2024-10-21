@@ -1,35 +1,118 @@
+import logging
 import asyncio
 import logging
+import sys
+import time
+import traceback
+
+import redis.asyncio as redis
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters.command import Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-import asyncio
-from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.filters.command import CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton
+from aiogram.utils.deep_linking import create_start_link
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from pytonapi import AsyncTonapi
+from pytonconnect import TonConnect
+from pytonconnect.exceptions import UserRejectsError
 from pytoniq_core import Address, Cell, StateInit
-import sys
-import redis.asyncio as redis
-
-import config
-import transactions
-from config import TOKEN
+from aiogram.utils.deep_linking import decode_payload as decode_deep_link
 
 import TonConnector
-from pytonconnect import TonConnect
+import config
+import database
 import models
-from pytonapi import AsyncTonapi
+import transactions
+import utils
+from config import TOKEN
 
 Redis_client = redis.Redis(host='localhost', port=6379)
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+
+async def pay_to_escrow(callback_query: types.CallbackQuery):
+    db = database.DatabaseHandler()
+    contract_address = Address(callback_query.data.split(":")[1])
+    offer = await db.search_offer(callback_query.from_user.id, contract_address)
+    if offer is None:
+        await callback_query.message.answer("Offer not found")
+        await callback_query.answer()
+        return
+    connector = TonConnector.get_connector(callback_query.message.chat.id)
+    connected = await connector.restore_connection()
+    if not connected:
+        await callback_query.message.answer(text='You did not connect any wallet!')
+        await callback_query.answer()
+        return
+    if offer.currency == "Ton":
+        message_to_send = transactions.get_deposit_ton_to_contrtact(contract_address, offer)
+    else:
+        tonapi = AsyncTonapi(api_key=config.tonapi_key)
+        responce = await utils.run_get_method(tonapi, offer.jetton_master.strip(),
+                                              "get_wallet_address",
+                                              [connector.account.address])
+        user_jetton_wallet = responce[0].begin_parse().load_address()
+        message_to_send = transactions.get_deposit_jetton_to_contrtact(contract_address,
+                                                                       Address(connector.account.address),
+                                                                       user_jetton_wallet, offer)
+
+    transaction = {
+        'valid_until': int(time.time() + 60 * 5),
+        'messages': [
+            message_to_send
+        ]
+    }
+
+    await callback_query.message.answer(text='Approve transaction in your wallet app!')
+    try:
+        await asyncio.wait_for(connector.send_transaction(
+            transaction=transaction
+        ), 60 * 5)
+    except asyncio.TimeoutError:
+        await callback_query.message.answer(text='Timeout error!')
+        await callback_query.answer()
+        return
+    except UserRejectsError:
+        await callback_query.message.answer(text='You rejected the transaction!')
+        await callback_query.answer()
+        return
+    except Exception as e:
+        await callback_query.message.answer(text=f'Unknown error: {e}')
+        await callback_query.answer()
+        return
+
+
+@dp.message(CommandStart(deep_link=True))
+async def seek_for_offer(message: types.Message, command: CommandObject):
+    connector = TonConnector.get_connector(message.chat.id)
+    connected = await connector.restore_connection()
+    if not connected:
+        await message.answer(text='Connect wallet first. You can do that by pressing /start')
+        return
+
+    args = command.args
+    deep_link = decode_deep_link(args)
+    if deep_link:
+        user_id, contract_address = deep_link.split(":")
+        await message.answer(f"User {user_id} wants to make a deal with you. Contract address: {contract_address}")
+        db = database.DatabaseHandler()
+        offer = await db.search_offer(int(user_id), Address(contract_address))
+        if offer is None:
+            await message.answer("Offer not found")
+            return
+
+        mk_b = InlineKeyboardBuilder()
+        mk_b.add(InlineKeyboardButton(text="Accept", callback_data=f"pay_to_escrow:{contract_address}"))
+        await message.answer(f"Offer: {offer.description}, {offer.price}, {offer.currency}, {offer.jetton_master}")
+
+    else:
+        await message.answer("Welcome to Escrow bot! Please, use /start command to start working with bot")
 
 
 @dp.message(Command("start"))
@@ -87,7 +170,8 @@ async def connect_wallet(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
-form_fields = ['Description (400 characters max.)', 'Price (float)', 'Currency (Ton or Jetton)']
+form_fields = ['Description (400 characters max.)', 'Price (float)', 'Currency (Ton or Jetton)',
+               "JettonMaster (for Jetton)"]
 
 
 class FormStates(StatesGroup):
@@ -98,7 +182,6 @@ class FormStates(StatesGroup):
 def get_form_keyboard(user_data):
     builder = InlineKeyboardBuilder()
     for field in form_fields:
-        print(user_data)
         value = user_data.get(field, 'Undefined')
         builder.add(
             InlineKeyboardButton(
@@ -111,7 +194,7 @@ def get_form_keyboard(user_data):
     return builder.as_markup()
 
 
-@dp.message(Command("CreateOffer"))
+@dp.message(Command("create_offer"))
 async def cmd_sell(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
     await message.answer(
@@ -153,10 +236,16 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     try:
         offer = models.Offer(*[data.get(field, None) for field in form_fields])
-        jetton_meta = await tonapi.jettons.get_info(offer.jetton_master)
-        offer.price = int(offer.price * 10 ** jetton_meta["metadata"]["decimals"])
+        if offer.currency == "Ton":
+            offer.recalculate_price_in_nano(9)
+        else:
+            info = await tonapi.accounts.get_info(offer.jetton_master)
+            if info.status != "active" or "jetton_master" not in info.interfaces:
+                await callback_query.message.answer(f"Invalid jetton_master")
+            offer.recalculate_price_in_nano(info["metadata"]["decimals"])
     except Exception as e:
-        await callback_query.answer(f"Error in fields {e}")
+        traceback.print_exc()
+        await callback_query.message.answer(f"Error in fields {e}")
         return
 
     try_num = 0
@@ -167,16 +256,60 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
         state_init = StateInit(code=deploy_code, data=deploy_data)
         new_contract_address = Address("0:" + state_init.serialize().hash.hex())
         info = await tonapi.accounts.get_info(new_contract_address.to_str())
-        if info["status"] != "active":
+        if info.status != "active":
             break
         try_num += 1
-    init_message = transactions.get_deploy_escrow_message(state_init=state_init, offer=offer)
+    connector = TonConnector.get_connector(callback_query.message.chat.id)
+    connected = await connector.restore_connection()
+    if not connected:
+        await callback_query.message.answer(text='You did not connect any wallet!')
+        await callback_query.answer()
+        return
+    else:
+        transaction = {
+            'valid_until': int(time.time() + 60 * 5),
+            'messages': [
+                transactions.get_deploy_escrow_message(state_init=state_init, offer=offer)
+            ]
+        }
 
+        await callback_query.message.answer(text='Approve transaction in your wallet app!')
+        try:
+            await asyncio.wait_for(connector.send_transaction(
+                transaction=transaction
+            ), 60 * 5)
+        except asyncio.TimeoutError:
+            await callback_query.message.answer(text='Timeout error!')
+            await callback_query.answer()
+            return
+        except UserRejectsError:
+            await callback_query.message.answer(text='You rejected the transaction!')
+            await callback_query.answer()
+            return
+        except Exception as e:
+            await callback_query.message.answer(text=f'Unknown error: {e}')
+            await callback_query.answer()
+            return
     await state.set_state(None)
-
+    address = Address("0:" + state_init.serialize().hash.hex())
+    deeplink_payload = str(callback_query.message.from_user.id) + ":" + address.to_str()
+    await callback_query.message.answer(
+        f"Your offer contract address is <code>{await create_start_link(bot, deeplink_payload, encode=True)}</code>"
+        f"Share it to anyone you want to make a deal :)")
+    db = database.DatabaseHandler()
+    await db.save_offer(offer, address, callback_query.message.from_user.id)
     await callback_query.answer()
-    await callback_query.message.answer("Accept transaction in your wallet app")
-    # Здесь можно использовать данные из data для создания оффера
+
+
+@dp.message(Command("disconnect"))
+async def disconnect_wallet(message: types.Message):
+    connector = TonConnector.get_connector(message.chat.id)
+    connected = await connector.restore_connection()
+    if not connected:
+        await message.answer('You are not connected with any wallet')
+        return
+    await message.answer('You have been successfully disconnected!')
+    await connector.disconnect()
 
 
 async def main():
@@ -188,6 +321,8 @@ async def main():
 
 if __name__ == "__main__":
     # register query handler
+    dp.callback_query.register(pay_to_escrow, lambda c: c.data and c.data.startswith('pay_to_escrow'))
+    dp.callback_query.register(deploy_offer, lambda c: c.data and c.data.startswith('deploy'))
     dp.callback_query.register(connect_wallet, lambda c: c.data and c.data.startswith('connect:'))
     dp.callback_query.register(process_callback_button, lambda c: c.data and c.data.startswith('field:'))
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
