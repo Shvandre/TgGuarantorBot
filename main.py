@@ -57,16 +57,7 @@ async def pay_to_escrow(callback_query: types.CallbackQuery):
         message_to_send = transactions.get_deposit_ton_to_contrtact(contract_address, offer)
     else:
         tonapi = AsyncTonapi(api_key=config.tonapi_key)
-        #responce = await utils.run_get_method(tonapi, offer.jetton_master.strip(),
-        #                                      "get_wallet_address",
-        #                                      [connector.account.address])
-        responce = await tonapi.blockchain.execute_get_method(offer.jetton_master.strip(), "get_wallet_address", connector.account.address)
-        if not responce.success:
-            await callback_query.message.answer(text='Invalid jetton master')
-            await callback_query.answer()
-            return
-
-        user_jetton_wallet = Cell.one_from_boc(responce.stack[0].cell).begin_parse().load_address()
+        user_jetton_wallet = await utils.get_user_jetton_wallet(tonapi, Address(offer.jetton_master), Address(connector.account.address))
 
         message_to_send = transactions.get_deposit_jetton_to_contrtact(contract_address,
                                                                        Address(connector.account.address),
@@ -285,6 +276,9 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
         try_num += 1
     connector = TonConnector.get_connector(callback_query.message.chat.id)
     connected = await connector.restore_connection()
+    user_jetton_wallet = None
+    if offer.currency == "Jetton":
+        user_jetton_wallet = await utils.get_user_jetton_wallet(tonapi, Address(offer.jetton_master), Address(connector.account.address))
     if not connected:
         await callback_query.message.answer(text='You did not connect any wallet!')
         await callback_query.answer()
@@ -293,7 +287,7 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
         transaction = {
             'valid_until': int(time.time() + 60 * 5),
             'messages': [
-                transactions.get_deploy_escrow_message(state_init=state_init, offer=offer)
+                transactions.get_deploy_escrow_message(state_init=state_init, offer=offer, user_jetton_wallet=user_jetton_wallet)
             ]
         }
 

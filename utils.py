@@ -1,5 +1,5 @@
 from pytonapi import AsyncTonapi
-from pytoniq_core import Cell, Slice
+from pytoniq_core import Cell, Slice, Address
 
 
 async def parse_stack(stack: list):
@@ -21,3 +21,13 @@ async def run_get_method(tonapi: AsyncTonapi, account_id: str, method_id: str, a
         stack = response.get("stack", [])
         stack = await parse_stack(stack)
         return stack
+
+
+async def get_user_jetton_wallet(tonapi: AsyncTonapi, jetton_master: Address, user_adress: Address):
+    responce = await tonapi.blockchain.execute_get_method(jetton_master.to_str().strip(), "get_wallet_address",
+                                                          user_adress.to_str())
+    if not responce.success:
+        return None
+
+    user_jetton_wallet = Cell.one_from_boc(responce.stack[0].cell).begin_parse().load_address()
+    return user_jetton_wallet

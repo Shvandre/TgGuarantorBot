@@ -54,13 +54,14 @@ def get_deposit_jetton_to_contrtact(contract_address: Address, user_address: Add
     }
     return data
 
-def get_deploy_escrow_message(state_init: StateInit, offer: Offer) -> dict:
+
+def get_deploy_escrow_message(state_init: StateInit, offer: Offer, user_jetton_wallet: Address) -> dict:
     if offer.currency == "Jetton":
 
         payload_cell = (begin_cell()
                         .store_uint(Opcodes.init_jetton_escrow, 32)
                         .store_uint(0, 64)
-                        .store_address("") #TODO fix this. Here must me user's jetton_wallet
+                        .store_address(user_jetton_wallet)
                         .store_coins(offer.price)
                         .end_cell())
     else:
