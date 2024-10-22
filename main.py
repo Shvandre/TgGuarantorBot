@@ -35,15 +35,18 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+dsn = "postgresql://postgres:@localhost:5432/postgres"
+db = database.DatabaseHandler(dsn=dsn)
+
 
 async def pay_to_escrow(callback_query: types.CallbackQuery):
-    db = database.DatabaseHandler()
-    contract_address = Address(callback_query.data.split(":")[1])
-    offer = await db.search_offer(callback_query.from_user.id, contract_address)
+    offer, user_id, contract_address = await db.search_by_uid(int(callback_query.data.split(":")[1]))
+
     if offer is None:
         await callback_query.message.answer("Offer not found")
         await callback_query.answer()
         return
+
     connector = TonConnector.get_connector(callback_query.message.chat.id)
     connected = await connector.restore_connection()
     if not connected:
@@ -54,10 +57,17 @@ async def pay_to_escrow(callback_query: types.CallbackQuery):
         message_to_send = transactions.get_deposit_ton_to_contrtact(contract_address, offer)
     else:
         tonapi = AsyncTonapi(api_key=config.tonapi_key)
-        responce = await utils.run_get_method(tonapi, offer.jetton_master.strip(),
-                                              "get_wallet_address",
-                                              [connector.account.address])
-        user_jetton_wallet = responce[0].begin_parse().load_address()
+        #responce = await utils.run_get_method(tonapi, offer.jetton_master.strip(),
+        #                                      "get_wallet_address",
+        #                                      [connector.account.address])
+        responce = await tonapi.blockchain.execute_get_method(offer.jetton_master.strip(), "get_wallet_address", connector.account.address)
+        if not responce.success:
+            await callback_query.message.answer(text='Invalid jetton master')
+            await callback_query.answer()
+            return
+
+        user_jetton_wallet = Cell.one_from_boc(responce.stack[0].cell).begin_parse().load_address()
+
         message_to_send = transactions.get_deposit_jetton_to_contrtact(contract_address,
                                                                        Address(connector.account.address),
                                                                        user_jetton_wallet, offer)
@@ -86,7 +96,8 @@ async def pay_to_escrow(callback_query: types.CallbackQuery):
         await callback_query.message.answer(text=f'Unknown error: {e}')
         await callback_query.answer()
         return
-
+    await callback_query.message.answer("Successfull transaction. Admin Will check everything and contact you")
+    await callback_query.answer()
 
 @dp.message(CommandStart(deep_link=True))
 async def seek_for_offer(message: types.Message, command: CommandObject):
@@ -97,19 +108,31 @@ async def seek_for_offer(message: types.Message, command: CommandObject):
         return
 
     args = command.args
-    deep_link = decode_deep_link(args)
+    deep_link = args
+
     if deep_link:
-        user_id, contract_address = deep_link.split(":")
-        await message.answer(f"User {user_id} wants to make a deal with you. Contract address: {contract_address}")
-        db = database.DatabaseHandler()
-        offer = await db.search_offer(int(user_id), Address(contract_address))
+
+        offer, user_id, contract_address = await db.search_by_uid(int(deep_link))
+
         if offer is None:
             await message.answer("Offer not found")
             return
 
+        user = await bot.get_chat(user_id)
+        print(user_id, user)
+        username = user.username
+
+        await message.answer(
+            f"User @{username} wants to make a deal with you. Contract address: {contract_address.to_str()}",
+            parse_mode=None
+        )
+
         mk_b = InlineKeyboardBuilder()
-        mk_b.add(InlineKeyboardButton(text="Accept", callback_data=f"pay_to_escrow:{contract_address}"))
-        await message.answer(f"Offer: {offer.description}, {offer.price}, {offer.currency}, {offer.jetton_master}")
+        mk_b.add(InlineKeyboardButton(text="Accept", callback_data=f"pay_to_escrow:{deep_link}"))
+        jetton_master_str = "" if offer.jetton_master is None else offer.jetton_master
+
+        await message.answer(f"Offer: (price in nanotons/nano Jettons): \n{offer.description} \n {offer.price} nano{offer.currency}\n {jetton_master_str}",
+                             reply_markup=mk_b.as_markup())
 
     else:
         await message.answer("Welcome to Escrow bot! Please, use /start command to start working with bot")
@@ -170,7 +193,7 @@ async def connect_wallet(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
-form_fields = ['Description (400 characters max.)', 'Price (float)', 'Currency (Ton or Jetton)',
+form_fields = ['Description (400 characters max.)', 'Price (integer in nanotons/nano jettons) ', 'Currency (Ton or Jetton)',
                "JettonMaster (for Jetton)"]
 
 
@@ -236,13 +259,14 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     try:
         offer = models.Offer(*[data.get(field, None) for field in form_fields])
-        if offer.currency == "Ton":
-            offer.recalculate_price_in_nano(9)
-        else:
-            info = await tonapi.accounts.get_info(offer.jetton_master)
-            if info.status != "active" or "jetton_master" not in info.interfaces:
-                await callback_query.message.answer(f"Invalid jetton_master")
-            offer.recalculate_price_in_nano(info["metadata"]["decimals"])
+        # if offer.currency == "Ton":
+        #     offer.recalculate_price_in_nano(9)
+        # else:
+        #     #info = await tonapi.accounts.get_info(offer.jetton_master)
+        #     #if info.status != "active" or "jetton_master" not in info.interfaces:
+        #     #    await callback_query.message.answer(f"Invalid jetton_master")
+        #     #offer.recalculate_price_in_nano(info.)
+        #     #offer.recalculate_price_in_nano(info["metadata"]["decimals"])
     except Exception as e:
         traceback.print_exc()
         await callback_query.message.answer(f"Error in fields {e}")
@@ -251,7 +275,7 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
     try_num = 0
     while True:  #maybe this contract is already taken
         deploy_data = transactions.create_ton_escrow_data(
-            hash(offer) + callback_query.message.from_user.id + try_num % 2 ** 64)
+            (hash(offer) + abs(callback_query.message.from_user.id) + try_num) % 2 ** 64)
         deploy_code = Cell.one_from_boc(config.escrow_code)
         state_init = StateInit(code=deploy_code, data=deploy_data)
         new_contract_address = Address("0:" + state_init.serialize().hash.hex())
@@ -275,6 +299,7 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
 
         await callback_query.message.answer(text='Approve transaction in your wallet app!')
         try:
+            pass
             await asyncio.wait_for(connector.send_transaction(
                 transaction=transaction
             ), 60 * 5)
@@ -292,12 +317,12 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
             return
     await state.set_state(None)
     address = Address("0:" + state_init.serialize().hash.hex())
-    deeplink_payload = str(callback_query.message.from_user.id) + ":" + address.to_str()
+    unique_id = await db.save_offer(offer, address, callback_query.from_user.id)
+    print(f"Your uid {callback_query.from_user.id}")
     await callback_query.message.answer(
-        f"Your offer contract address is <code>{await create_start_link(bot, deeplink_payload, encode=True)}</code>"
+        f"Your offer link is \n<code>{await create_start_link(bot, str(unique_id))}</code>\n"
         f"Share it to anyone you want to make a deal :)")
-    db = database.DatabaseHandler()
-    await db.save_offer(offer, address, callback_query.message.from_user.id)
+
     await callback_query.answer()
 
 
@@ -315,6 +340,8 @@ async def disconnect_wallet(message: types.Message):
 async def main():
     tonapi = AsyncTonapi(api_key=config.tonapi_key)
 
+    # Инициализируем пул соединений
+    await db.initialize()
     await bot.delete_webhook(drop_pending_updates=True)  # skip_updates = True
     await dp.start_polling(bot)
 

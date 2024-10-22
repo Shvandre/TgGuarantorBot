@@ -14,6 +14,7 @@ async def parse_stack(stack: list):
 
 
 async def run_get_method(tonapi: AsyncTonapi, account_id: str, method_id: str, args: list) -> list[int | Cell]:
+
     get_method = f"v2/accounts/{account_id}/methods/{method_id}"
     response = await tonapi._get(method=get_method, params={"args": args})
     if not response.get("success", 1):

@@ -12,11 +12,11 @@ class CurrencyEnum(str, Enum):
 
 class Offer(BaseModel):
     description: str
-    price: float | int
+    price: int
     currency: str
     jetton_master: Optional[str]
 
-    def __init__(self, description: str, price: float | int, currency: str, jetton_master: str | None = None):
+    def __init__(self, description: str, price: int, currency: str, jetton_master: str | None = None):
         super().__init__(description=description, price=price, currency=currency, jetton_master=jetton_master)
 
     def recalculate_price_in_nano(self, decimals: int):
