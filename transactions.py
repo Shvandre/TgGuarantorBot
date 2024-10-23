@@ -44,24 +44,24 @@ def get_deposit_jetton_to_contrtact(contract_address: Address, user_address: Add
                     .store_address(contract_address)
                     .store_address(user_address)
                     .store_uint(0, 1)
-                    .store_coins(1)
+                    .store_coins(100000000)
                     .store_uint(0, 1)
                     .end_cell())
     data = {
         'address': user_jetton_wallet.to_str(is_user_friendly=False),
-        'amount': toNano(0.1),
+        'amount': toNano(0.2),
         'payload': urlsafe_b64encode(payload_cell.to_boc()).decode()
     }
     return data
 
 
-def get_deploy_escrow_message(state_init: StateInit, offer: Offer, user_jetton_wallet: Address) -> dict:
+def get_deploy_escrow_message(state_init: StateInit, offer: Offer, escrow_jetton_wallet: Address) -> dict:
     if offer.currency == "Jetton":
-
+        print(escrow_jetton_wallet)
         payload_cell = (begin_cell()
                         .store_uint(Opcodes.init_jetton_escrow, 32)
                         .store_uint(0, 64)
-                        .store_address(user_jetton_wallet)
+                        .store_address(escrow_jetton_wallet)
                         .store_coins(offer.price)
                         .end_cell())
     else:
