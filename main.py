@@ -276,7 +276,7 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
         try_num += 1
     connector = TonConnector.get_connector(callback_query.message.chat.id)
     connected = await connector.restore_connection()
-    user_jetton_wallet = None
+    escrow_jetton_wallet = None
     if offer.currency == "Jetton":
         escrow_jetton_wallet = await utils.get_user_jetton_wallet(tonapi, Address(offer.jetton_master), new_contract_address)
     if not connected:
@@ -287,7 +287,7 @@ async def deploy_offer(callback_query: types.CallbackQuery, state: FSMContext):
         transaction = {
             'valid_until': int(time.time() + 60 * 5),
             'messages': [
-                transactions.get_deploy_escrow_message(state_init=state_init, offer=offer, user_jetton_wallet=escrow_jetton_wallet)
+                transactions.get_deploy_escrow_message(state_init=state_init, offer=offer, escrow_jetton_wallet=escrow_jetton_wallet)
             ]
         }
 
